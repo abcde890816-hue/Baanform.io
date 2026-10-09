@@ -1,0 +1,377 @@
+require 'webrick'
+require 'json'
+require 'openssl'
+require 'securerandom'
+require 'fileutils'
+require 'uri'
+
+ROOT = File.expand_path(__dir__)
+EMPLOYEE_DATABASE = File.join(ROOT, 'data', 'employees.json')
+PROMOTION_DATABASE = File.join(ROOT, 'data', 'promotions.json')
+PROMOTION_DIRECTORY = File.join(ROOT, 'data', 'media')
+PROMOTION_SETTINGS_DATABASE = File.join(ROOT, 'data', 'promotion-settings.json')
+OWNER_USERNAME = 'xiaozhao'.freeze
+OWNER_PASSWORD = 'Qwer2026@'.freeze
+PASSWORD_ITERATIONS = 120_000
+DATABASE_LOCK = Mutex.new
+SESSION_LOCK = Mutex.new
+SESSIONS = {}
+STARTER_PROMOTIONS = [
+  { id: 'starter-1', title: 'บ้านที่ปล่อยให้แสงเล่าเรื่อง', type: 'image', src: 'https://images.unsplash.com/photo-1600607687920-4e2a09cf159d?auto=format&fit=crop&w=1200&q=82', createdAt: 3 },
+  { id: 'starter-2', title: 'พื้นที่เล็กที่คิดมาอย่างพอดี', type: 'image', src: 'https://images.unsplash.com/photo-1600210492486-724fe5c67fb0?auto=format&fit=crop&w=1200&q=82', createdAt: 2 },
+  { id: 'starter-3', title: 'กลับบ้านมาเจอสวนทุกวัน', type: 'image', src: 'https://images.unsplash.com/photo-1600566753086-00f18fb6b3ea?auto=format&fit=crop&w=1200&q=82', createdAt: 1 }
+].map { |promo| promo.transform_keys(&:to_s) }.freeze
+PAGE_ROUTES = {
+  '/': 'index.html',
+  '/home': 'index.html',
+  '/index.html': 'index.html',
+  '/admin': 'admin.html',
+  '/admin.html': 'admin.html',
+  '/admin1': 'admin.html',
+  '/boss': 'boss.html',
+  '/boss.html': 'boss.html',
+  '/bossadmin': 'boss.html',
+  '/bossadmin1': 'boss.html'
+}.transform_keys(&:to_s).freeze
+CONTENT_TYPES = {
+  '.css' => 'text/css; charset=utf-8',
+  '.html' => 'text/html; charset=utf-8',
+  '.js' => 'application/javascript; charset=utf-8',
+  '.png' => 'image/png',
+  '.jpg' => 'image/jpeg',
+  '.jpeg' => 'image/jpeg',
+  '.svg' => 'image/svg+xml',
+  '.webp' => 'image/webp'
+}.freeze
+
+def read_employees
+  return {} unless File.file?(EMPLOYEE_DATABASE)
+  JSON.parse(File.read(EMPLOYEE_DATABASE))
+end
+
+def write_employees(employees)
+  FileUtils.mkdir_p(File.dirname(EMPLOYEE_DATABASE))
+  temporary_path = EMPLOYEE_DATABASE + '.tmp'
+  File.write(temporary_path, JSON.pretty_generate(employees))
+  File.rename(temporary_path, EMPLOYEE_DATABASE)
+end
+
+def read_promotions
+  unless File.file?(PROMOTION_DATABASE)
+    return STARTER_PROMOTIONS.map { |promo| promo.merge('placement' => 'portfolio') }
+  end
+  JSON.parse(File.read(PROMOTION_DATABASE)).each do |promo|
+    promo['placement'] ||= 'portfolio'
+  end
+end
+
+def write_promotions(promotions)
+  FileUtils.mkdir_p(File.dirname(PROMOTION_DATABASE))
+  temporary_path = PROMOTION_DATABASE + '.tmp'
+  File.write(temporary_path, JSON.pretty_generate(promotions))
+  File.rename(temporary_path, PROMOTION_DATABASE)
+end
+
+def read_promotion_settings
+  return { 'heroIntervalSeconds' => 10 } unless File.file?(PROMOTION_SETTINGS_DATABASE)
+  JSON.parse(File.read(PROMOTION_SETTINGS_DATABASE))
+end
+
+def write_promotion_settings(settings)
+  FileUtils.mkdir_p(File.dirname(PROMOTION_SETTINGS_DATABASE))
+  temporary_path = PROMOTION_SETTINGS_DATABASE + '.tmp'
+  File.write(temporary_path, JSON.pretty_generate(settings))
+  File.rename(temporary_path, PROMOTION_SETTINGS_DATABASE)
+end
+
+def json_body(request)
+  raise ArgumentError, 'คำขอมีขนาดใหญ่เกินไป' if request.body.to_s.bytesize > 65_536
+  JSON.parse(request.body.to_s.empty? ? '{}' : request.body)
+rescue JSON::ParserError
+  raise ArgumentError, 'รูปแบบข้อมูลไม่ถูกต้อง'
+end
+
+def json_response(response, status, payload)
+  response.status = status
+  response['Content-Type'] = 'application/json; charset=utf-8'
+  response['Cache-Control'] = 'no-store'
+  response.body = JSON.generate(payload)
+end
+
+def password_hash(password, salt)
+  OpenSSL::PKCS5.pbkdf2_hmac(password, [salt].pack('H*'), PASSWORD_ITERATIONS, 32, 'sha256').unpack1('H*')
+end
+
+def secure_equal(left, right)
+  return false unless left.is_a?(String) && right.is_a?(String) && left.bytesize == right.bytesize
+  left.bytes.zip(right.bytes).reduce(0) { |difference, (a, b)| difference | (a ^ b) }.zero?
+end
+
+def create_session(role)
+  token = SecureRandom.hex(32)
+  SESSION_LOCK.synchronize { SESSIONS[token] = role }
+  token
+end
+
+def session_role(request)
+  token = request['authorization'].to_s.sub(/\ABearer\s+/i, '')
+  SESSION_LOCK.synchronize { SESSIONS[token] }
+end
+
+def valid_username?(username)
+  username.is_a?(String) && username.match?(/\A[A-Za-z0-9._]{3,24}\z/)
+end
+
+def api_error(response, status, message)
+  json_response(response, status, { error: message })
+end
+
+server = WEBrick::HTTPServer.new(
+  Port: 4173,
+  BindAddress: '0.0.0.0',
+  AccessLog: [],
+  Logger: WEBrick::Log.new($stderr, WEBrick::Log::WARN)
+)
+
+server.mount_proc('/baanform') do |request, response|
+  route = request.path.sub(%r{\A/baanform}, '')
+  route = '/' if route.empty?
+
+  if route.start_with?('/api/')
+    begin
+      case [request.request_method, route]
+      when ['POST', '/api/owner/login']
+        body = json_body(request)
+        if secure_equal(body['username'], OWNER_USERNAME) && secure_equal(body['password'], OWNER_PASSWORD)
+          json_response(response, 200, { token: create_session('owner'), username: OWNER_USERNAME })
+        else
+          api_error(response, 401, 'ชื่อผู้ใช้หรือรหัสผ่านไม่ถูกต้อง')
+        end
+      when ['POST', '/api/employee/login']
+        body = json_body(request)
+        username = body['username'].to_s.strip.downcase
+        employee = DATABASE_LOCK.synchronize { read_employees[username] }
+        if employee && secure_equal(password_hash(body['password'].to_s, employee['salt']), employee['password_hash'])
+          json_response(response, 200, { token: create_session('employee'), username: employee['username'] })
+        else
+          api_error(response, 401, 'ชื่อผู้ใช้หรือรหัสผ่านไม่ถูกต้อง')
+        end
+      when ['POST', '/api/logout']
+        token = request['authorization'].to_s.sub(/\ABearer\s+/i, '')
+        SESSION_LOCK.synchronize { SESSIONS.delete(token) }
+        json_response(response, 200, { ok: true })
+      when ['GET', '/api/session']
+        role = session_role(request)
+        role ? json_response(response, 200, { role: role }) : api_error(response, 401, 'เซสชันหมดอายุ กรุณาเข้าสู่ระบบใหม่')
+      when ['GET', '/api/employees']
+        if session_role(request) != 'owner'
+          api_error(response, 401, 'ต้องเข้าสู่ระบบหัวหน้าก่อน')
+        else
+          employees = DATABASE_LOCK.synchronize { read_employees.values.map { |employee| { username: employee['username'], createdAt: employee['created_at'] } } }
+          json_response(response, 200, employees)
+        end
+      when ['POST', '/api/employees']
+        if session_role(request) != 'owner'
+          api_error(response, 401, 'ต้องเข้าสู่ระบบหัวหน้าก่อน')
+        else
+          body = json_body(request)
+          username = body['username'].to_s.strip
+          password = body['password'].to_s
+          raise ArgumentError, 'ชื่อผู้ใช้ต้องยาว 3-24 ตัวและใช้ได้เฉพาะ A-Z, 0-9, จุด หรือขีดล่าง' unless valid_username?(username)
+          raise ArgumentError, 'รหัสผ่านต้องมีอย่างน้อย 8 ตัวอักษร' if password.length < 8
+          normalized_username = username.downcase
+          result = DATABASE_LOCK.synchronize do
+            employees = read_employees
+            raise ArgumentError, 'บัญชีนี้มีอยู่แล้ว' if employees.key?(normalized_username)
+            salt = SecureRandom.hex(16)
+            employees[normalized_username] = {
+              'username' => username,
+              'salt' => salt,
+              'password_hash' => password_hash(password, salt),
+              'created_at' => Time.now.to_i
+            }
+            write_employees(employees)
+            { username: username }
+          end
+          json_response(response, 201, result)
+        end
+      when ['POST', '/api/employees/update']
+        if session_role(request) != 'owner'
+          api_error(response, 401, 'ต้องเข้าสู่ระบบหัวหน้าก่อน')
+        else
+          body = json_body(request)
+          old_username = body['currentUsername'].to_s.strip.downcase
+          username = body['username'].to_s.strip
+          password = body['password'].to_s
+          raise ArgumentError, 'ชื่อผู้ใช้ไม่ถูกต้อง' unless valid_username?(username)
+          raise ArgumentError, 'รหัสผ่านต้องมีอย่างน้อย 8 ตัวอักษร' if !password.empty? && password.length < 8
+          result = DATABASE_LOCK.synchronize do
+            employees = read_employees
+            employee = employees[old_username]
+            raise ArgumentError, 'ไม่พบบัญชีพนักงาน' unless employee
+            normalized_username = username.downcase
+            raise ArgumentError, 'บัญชีนี้มีอยู่แล้ว' if normalized_username != old_username && employees.key?(normalized_username)
+            updated_employee = employee.merge('username' => username)
+            unless password.empty?
+              salt = SecureRandom.hex(16)
+              updated_employee['salt'] = salt
+              updated_employee['password_hash'] = password_hash(password, salt)
+            end
+            employees.delete(old_username)
+            employees[normalized_username] = updated_employee
+            write_employees(employees)
+            { username: username }
+          end
+          json_response(response, 200, result)
+        end
+      when ['POST', '/api/employees/delete']
+        if session_role(request) != 'owner'
+          api_error(response, 401, 'ต้องเข้าสู่ระบบหัวหน้าก่อน')
+        else
+          username = json_body(request)['username'].to_s.strip.downcase
+          DATABASE_LOCK.synchronize do
+            employees = read_employees
+            employees.delete(username)
+            write_employees(employees)
+          end
+          json_response(response, 200, { ok: true })
+        end
+      when ['GET', '/api/promotions']
+        promotions = DATABASE_LOCK.synchronize { read_promotions.sort_by { |promo| -promo['createdAt'].to_i } }
+        json_response(response, 200, promotions)
+      when ['GET', '/api/promotion-settings']
+        settings = DATABASE_LOCK.synchronize { read_promotion_settings }
+        json_response(response, 200, settings)
+      when ['POST', '/api/promotion-settings']
+        if ['owner', 'employee'].include?(session_role(request))
+          seconds = Integer(json_body(request)['heroIntervalSeconds'])
+          raise ArgumentError, 'กำหนดเวลาได้ตั้งแต่ 3 ถึง 120 วินาที' unless seconds.between?(3, 120)
+          settings = { 'heroIntervalSeconds' => seconds }
+          DATABASE_LOCK.synchronize { write_promotion_settings(settings) }
+          json_response(response, 200, settings)
+        else
+          api_error(response, 401, 'กรุณาเข้าสู่ระบบก่อนแก้ไขการแสดงผล')
+        end
+      when ['POST', '/api/promotions']
+        unless ['owner', 'employee'].include?(session_role(request))
+          api_error(response, 401, 'กรุณาเข้าสู่ระบบก่อนเพิ่มสื่อ')
+        else
+          content_type = request['content-type'].to_s.split(';').first
+          extensions = { 'image/jpeg' => '.jpg', 'image/png' => '.png', 'image/webp' => '.webp', 'video/mp4' => '.mp4', 'video/webm' => '.webm' }
+          extension = extensions[content_type]
+          raise ArgumentError, 'รองรับ JPG, PNG, WEBP, MP4 และ WEBM เท่านั้น' unless extension
+          media = request.body.to_s.b
+          raise ArgumentError, 'ไฟล์ว่างเปล่า' if media.empty?
+          raise ArgumentError, 'ไฟล์มีขนาดเกิน 30 MB' if media.bytesize > 30 * 1024 * 1024
+          title = URI.decode_www_form_component(request['x-media-title'].to_s).strip
+          raise ArgumentError, 'กรุณาระบุชื่อสื่อ' if title.empty?
+          placement = request['x-media-placement'].to_s
+          raise ArgumentError, 'กรุณาเลือกตำแหน่งแสดงผล' unless ['hero', 'portfolio'].include?(placement)
+          id = SecureRandom.hex(16)
+          FileUtils.mkdir_p(PROMOTION_DIRECTORY)
+          file_path = File.join(PROMOTION_DIRECTORY, id + extension)
+          File.binwrite(file_path, media)
+          promo = {
+            id: id,
+            title: title,
+            type: content_type.start_with?('video/') ? 'video' : 'image',
+            placement: placement,
+            src: '/baanform/media/' + id,
+            contentType: content_type,
+            filename: id + extension,
+            createdAt: Time.now.to_i * 1000
+          }
+          DATABASE_LOCK.synchronize do
+            promotions = read_promotions
+            promotions.unshift(promo)
+            write_promotions(promotions)
+          end
+          json_response(response, 201, promo.reject { |key, _value| key == :filename })
+        end
+      when ['POST', '/api/promotions/delete']
+        unless ['owner', 'employee'].include?(session_role(request))
+          api_error(response, 401, 'กรุณาเข้าสู่ระบบก่อนลบสื่อ')
+        else
+          id = json_body(request)['id'].to_s
+          unless id.match?(/\A[a-f0-9]{32}\z/) || id.match?(/\Astarter-[1-3]\z/)
+            raise ArgumentError, 'รหัสสื่อไม่ถูกต้อง'
+          end
+          removed = DATABASE_LOCK.synchronize do
+            promotions = read_promotions
+            promo = promotions.find { |entry| entry['id'] == id }
+            promotions.reject! { |entry| entry['id'] == id }
+            write_promotions(promotions)
+            promo
+          end
+          File.delete(File.join(PROMOTION_DIRECTORY, removed['filename'])) if removed && removed['filename'] && File.file?(File.join(PROMOTION_DIRECTORY, removed['filename']))
+          json_response(response, 200, { ok: true })
+        end
+      else
+        api_error(response, 404, 'ไม่พบ API')
+      end
+    rescue ArgumentError => error
+      api_error(response, 400, error.message)
+    rescue StandardError => error
+      warn "API error: #{error.class}: #{error.message}"
+      api_error(response, 500, 'ระบบขัดข้อง กรุณาลองอีกครั้ง')
+    end
+    next
+  end
+
+  if request.request_method == 'GET' && route.start_with?('/media/')
+    id = route.sub(%r{\A/media/}, '')
+    promotion = DATABASE_LOCK.synchronize { read_promotions.find { |promo| promo['id'] == id && promo['filename'] } }
+    if promotion && id.match?(/\A[a-f0-9]{32}\z/)
+      file_path = File.join(PROMOTION_DIRECTORY, promotion['filename'])
+      if File.file?(file_path)
+        response.status = 200
+        response['Content-Type'] = promotion['contentType']
+        response['Cache-Control'] = 'public, max-age=3600'
+        response.body = File.binread(file_path)
+      else
+        response.status = 404
+        response.body = 'Not found'
+      end
+    else
+      response.status = 404
+      response.body = 'Not found'
+    end
+    next
+  end
+
+  relative_path = PAGE_ROUTES[route] || route.sub(%r{\A/}, '')
+  file_path = File.expand_path(relative_path, ROOT)
+  database_path = File.join(ROOT, 'data') + File::SEPARATOR
+
+  if file_path.start_with?(ROOT + File::SEPARATOR) && !file_path.start_with?(database_path) && File.file?(file_path)
+    response.status = 200
+    response['Content-Type'] = CONTENT_TYPES.fetch(File.extname(file_path), 'application/octet-stream')
+    response['Cache-Control'] = 'no-store'
+    response.body = File.binread(file_path)
+  else
+    response.status = 404
+    response['Content-Type'] = 'text/plain; charset=utf-8'
+    response.body = 'Not found'
+  end
+end
+
+server.mount_proc('/') do |request, response|
+  relative_path = PAGE_ROUTES[request.path] || request.path.sub(%r{\A/}, '')
+  file_path = File.expand_path(relative_path, ROOT)
+  database_path = File.join(ROOT, 'data') + File::SEPARATOR
+
+  if file_path.start_with?(ROOT + File::SEPARATOR) && !file_path.start_with?(database_path) && File.file?(file_path)
+    response.status = 200
+    response['Content-Type'] = CONTENT_TYPES.fetch(File.extname(file_path), 'application/octet-stream')
+    response['Cache-Control'] = 'no-store'
+    response.body = File.binread(file_path)
+  else
+    response.status = 404
+    response['Content-Type'] = 'text/plain; charset=utf-8'
+    response.body = 'Not found'
+  end
+end
+
+trap('INT') { server.shutdown }
+trap('TERM') { server.shutdown }
+server.start
